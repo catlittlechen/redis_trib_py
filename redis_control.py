@@ -11,30 +11,46 @@ RebalanceDefaultThreshold = 2
 import random
 import time
 from math import ceil, floor
-from redis_node import ClusterNode
+from redis_node import ClusterNode, createRedisNode
 
 
 class RedisControl():
 
-    def __init__(self, cluster_addr=None, replicas=1, fix=False):
+    def __init__(self, cluster_addr=None, replicas=1, fix=False, pipeline=None):
         self.nodes = set()
         self.fix = fix
         self.errors = []
         self.timeout = MigrateDefaultTimeout
         self.replicas = replicas
         self.cluster_addr = cluster_addr
+        self.pipeline = pipeline
+        if not self.pipeline:
+            self.pipeline = MigrateDefaultPipeline
         if self.cluster_addr:
             self.load_cluster_info_from_node(cluster_addr)
             self.check_cluster()
+            if len(self.errors) != 0:
+                print("*** Please fix your cluster problems")
+                exit(1)
         return
 
     def add_node(self, node):
+        for n in self.nodes:
+            if n.info["addr"] == node.info["addr"]:
+                print("ERR node exists")
         self.nodes.add(node)
         return
 
     def reset_nodes(self):
+        for node in self.nodes:
+            node.r.close()
         self.nodes = set()
         return
+
+    def reload_info(self):
+        self.reset_nodes()
+        self.load_cluster_info_from_node(self.cluster_addr)
+        self.check_cluster()
 
     def cluster_error(self, msg):
         self.errors.append(msg)
@@ -162,7 +178,7 @@ class RedisControl():
         if len(none) > 0:
             print("The folowing uncovered slots have no keys across the cluster:")
             for slot in none:
-                node = self.nodes[random.randint(0, len(self.nodes))-1]
+                node = list(self.nodes)[random.randint(0, len(self.nodes))-1]
                 print(">>> Covering slot %s with %s" % (slot, node))
                 node.r.execute("cluster", "addslots", slot)
 
@@ -316,7 +332,7 @@ class RedisControl():
         elif len(importing) == 0 and len(migrating) == 1 and len(migrating[0].r.execute("cluster", "getkeysinslot", slot, 1)) == 0:
             migrating[0].r.execute("cluster", "setslot", slot, "stable")
         else:
-            print("[ERR] Sorry, Redis-trib can't fix this slot yet (work in progress). Slot is set as migrating in %s, as importing in %s, owner is %s" % (",".join(migrating), ",".join(importing), owner))
+            print("[ERR] Sorry, can't fix this slot yet (work in progress). Slot is set as migrating in %s, as importing in %s, owner is %s" % (",".join(migrating), ",".join(importing), owner))
 
     # Check if all the nodes agree about the cluster configuration
     def check_config_consistency(self):
@@ -483,18 +499,13 @@ class RedisControl():
             n.r.execute("cluster", "meet", first["host"], first["port"])
 
     def load_cluster_info_from_node(self, nodeaddr):
-        node = ClusterNode(nodeaddr)
-        node.connect()
-        node.assert_cluster()
-        node.load_info()
+        node = createRedisNode(nodeaddr)
         self.add_node(node)
         for f in node.friends:
             print("addr: %s %s" % (f["addr"], f["flags"]))
             if "noaddr" in f["flags"] or "disconnected" in f["flags"] or "fail" in f["flags"]:
                 continue
-            fnode = ClusterNode(f["addr"])
-            fnode.connect()
-            fnode.load_info()
+            fnode = createRedisNode(f["addr"])
             self.add_node(fnode)
         self.populate_nodes_replicas_info()
         return
@@ -550,12 +561,10 @@ class RedisControl():
     # Move slots between source and target nodes using MIGRATE.
     #
     # Options:
-    # :verbose -- Print a dot for every moved key.
     # :fix     -- We are moving in the context of a fix. Use REPLACE.
     # :cold    -- Move keys without opening slots / reconfiguring the nodes.
-    # :update  -- Update nodes.info[:slots] for source/target nodes.
-    def move_slot(self, source,target,slot,opt):
-        o = {"pipeline": MigrateDefaultPipeline}
+    def move_slot(self, source, target, slot, opt):
+        o = {"pipeline": self.pipeline}
         o.update(opt)
 
         # We start marking the slot as importing in the destination node,
@@ -593,12 +602,11 @@ class RedisControl():
                 n.r.execute("cluster", "setslot", slot, "node", target.full_name())
 
         # Update the node logical config
-        if "update" in o and o["update"]:
-            if slot in source.info["slots"]:
-                source.info["slots"].remove(slot)
-            if slot in source.info["new_slots"]:
-                source.info["new_slots"].remove(slot)
-            target.info["slots"].add(slot)
+        if slot in source.info["slots"]:
+            source.info["slots"].remove(slot)
+        if slot in source.info["new_slots"]:
+            source.info["new_slots"].remove(slot)
+        target.info["slots"].add(slot)
         return
 
     def show_nodes(self):
@@ -620,14 +628,10 @@ class RedisControl():
             exit(1)
         return
 
-    def create_cluster_cmd(self, addrs, replicas=0):
-        self.replicas = replicas
+    def create_cluster_cmd(self, addrs):
         print(">>> Creating cluster")
-        for n in addrs:
-            node = ClusterNode(n)
-            node.load_info()
-            node.assert_cluster()
-            node.assert_empty()
+        for addr in addrs:
+            node = createRedisNode(addr, new=True)
             self.add_node(node)
 
         self.check_create_parameters()
@@ -652,26 +656,16 @@ class RedisControl():
         self.reset_nodes()
         self.load_cluster_info_from_node(addrs[0])
         self.check_cluster()
+        self.cluster_addr = addrs[0]
 
         return
 
-    def check_cluster_cmd(self, addrs, replicas=0):
-        self.replicas = replicas
+    def check_cluster_cmd(self):
         print(">>> Checking cluster")
-        for n in addrs:
-            node = ClusterNode(n)
-            node.load_info()
-            node.assert_cluster()
-            self.add_node(node)
         self.check_config_consistency()
 
-    def addnode_cluster_cmd(self, node_addr, cluster_addr, slave=False, master_id=None):
-        print(">>> Adding node %s to cluster %s" % (node_addr, cluster_addr))
-
-        # Check the existing cluster
-        self.reset_nodes()
-        self.load_cluster_info_from_node(cluster_addr)
-        self.check_cluster()
+    def addnode_cluster_cmd(self, node_addr, slave=False, master_id=None):
+        print(">>> Adding node %s to cluster" % node_addr)
 
         # If --master-id was specified, try to resolve it now so that we
         # abort before starting with the node configuration.
@@ -680,16 +674,13 @@ class RedisControl():
                 master = self.get_node_by_name(master_id)
                 if not master:
                     print("[ERR] No such master ID %s" % master_id)
+                    exit(1)
             else:
                 master = self.get_master_with_least_replicas()
                 print("Automatically selected master %s" % master)
 
         # Add the new node
-        new = ClusterNode(node_addr)
-        new.connect()
-        new.assert_cluster()
-        new.load_info()
-        new.assert_empty()
+        new = createRedisNode(node_addr, new=True)
         first = list(self.nodes)[0].info
         self.add_node(new)
 
@@ -699,34 +690,20 @@ class RedisControl():
 
         # Additional configuration is needed if the node is added as
         # a slave.
+        self.wait_cluster_join()
         if slave:
-            self.wait_cluster_join()
             print(">>> Configure node as replica of %s." % master.full_name())
             time.sleep(1)
             new.r.execute("cluster", "replicate", master.full_name())
-        print("[OK] New node added correctly.")
+            self.wait_cluster_join()
+
+        self.reload_info()
+        print(">>>[OK] New node added correctly.")
         return
 
-    def rebalance_cluster_cmd(self, cluster_addr, pipeline=None):
-        opt = {
-            'pipeline' : MigrateDefaultPipeline,
-            'threshold' : RebalanceDefaultThreshold
-        }
-        if pipeline:
-            opt['pipeline'] = pipeline
-
-        # Load nodes info before parsing options, otherwise we can't
-        # handle --weight.
-        self.load_cluster_info_from_node(cluster_addr)
-
-        # Options parsing
-        threshold = opt['threshold']
-
-        # Check cluster, only proceed if it looks same.
-        self.check_cluster(quiet=True)
-        if len(self.errors) != 0:
-            print("*** Please fix your cluster problems before rebalancing")
-            exit(1)
+    def rebalance_cluster_cmd(self, threshold=None):
+        if not threshold:
+            threshold = RebalanceDefaultThreshold
 
         # Only consider nodes we want to change
         sn = []
@@ -735,34 +712,28 @@ class RedisControl():
                 print("master node: %s" % n)
                 sn.append(n)
 
-        total_weight = len(sn)
-        nodes_involved = len(sn)
-
         # Assign a weight to each node, and compute the total cluster weight.
         # Calculate the slots balance for each node. It's the number of
         # slots the node should lose (if positive) or gain (if negative)
         # in order to be balanced.
         threshold_reached = False
+        expected = int(float(ClusterHashSlots) / len(sn))
         for n in self.nodes:
             slots_length = n.slots_length()
             if n.has_flag("master"):
-                expected = int(float(ClusterHashSlots) / total_weight)
                 n.info["balance"] = slots_length - expected
                 # Compute the percentage of difference between the
                 # expected number of slots and the real one, to see
                 # if it's over the threshold specified by the user.
-                over_threshold = False
-                if threshold > 0:
-                    if slots_length > 0:
-                        err_perc = 100-(100.0*expected/slots_length)
-                        if err_perc < 0:
-                            err_perc = -err_perc
-                        if err_perc > threshold:
-                            over_threshold = True
-                    elif expected > 0:
-                        over_threshold = True
-                if over_threshold:
-                    threshold_reached = True
+                if not threshold_reached:
+                    perc = slots_length * threshold
+                    if n.info["balance"] < 0:
+                        if n.info["balance"] < -perc:
+                            threshold_reached = True
+                    else:
+                        if n.info["balance"] > perc:
+                            threshold_reached = True
+
         if not threshold_reached:
             print("*** No rebalancing needed! All nodes are within the %d threshold." % threshold)
             return
@@ -775,16 +746,15 @@ class RedisControl():
             total_balance += n.info["balance"]
         while total_balance > 0:
             for n in sn:
+                if total_balance <= 0:
+                    break
                 if n.info["balance"] < 0:
-                    if total_balance <= 0:
-                        break
                     n.info["balance"] -= 1
                     total_balance -= 1
 
         # Sort nodes by their slots balance.
         sn = sorted(sn, key=lambda x: x.info["balance"])
-
-        print(">>> Rebalancing across %d nodes. Total weight = %d" % (nodes_involved, total_weight))
+        print(">>> Rebalancing across %d nodes" % len(sn))
 
         # Now we have at the start of the 'sn' array nodes that should get
         # slots, at the end nodes that must give slots.
@@ -813,7 +783,7 @@ class RedisControl():
                     exit(1)
 
                 for e in reshard_table:
-                    self.move_slot(e["source"], dst, e["slot"], {"update": True})
+                    self.move_slot(e["source"], dst, e["slot"], {})
                     print("#")
 
             # Update nodes balance.
@@ -824,18 +794,12 @@ class RedisControl():
             if src.info["balance"] == 0:
                 src_idx -= 1
 
-    def reshard_cluster_cmd(self, cluster_addr, target_name, source_name_list, number, o={}):
+    def reshard_cluster_cmd(self, target_name, source_name_list, number, o={}):
         opt = {
             "pipeline" : MigrateDefaultPipeline,
             "timeout": self.timeout
         }
         opt.update(o)
-
-        self.load_cluster_info_from_node(cluster_addr)
-        self.check_cluster()
-        if len(self.errors) != 0:
-            print("*** Please fix your cluster problems before resharding")
-            exit(1)
 
         # Get the target instance
         target = self.get_node_by_name(target_name)
@@ -845,7 +809,7 @@ class RedisControl():
 
         if len(source_name_list) == 0:
             print("*** No source nodes given, operation aborted")
-            exit(1)
+            return
 
         # Get the source instances
         sources = []
@@ -877,11 +841,8 @@ class RedisControl():
         for e in reshard_table:
             self.move_slot(e["source"], target, e["slot"], {"pipeline":opt['pipeline']})
 
-    def delnode_cluster_cmd(self, cluster_addr, node_name):
-        print(">>> Removing node %s from cluster %s" % (node_name, cluster_addr))
-
-        # Load cluster information
-        self.load_cluster_info_from_node(cluster_addr)
+    def delnode_cluster_cmd(self, node_name):
+        print(">>> Removing node %s from cluster " % node_name)
 
         # Check if the node exists and is not empty
         node = self.get_node_by_name(node_name)
@@ -905,19 +866,22 @@ class RedisControl():
                 n.r.execute("cluster", "replicate", master.full_name())
             n.r.execute("cluster", "forget", node_name)
 
+        self.reload_info()
+        print(">>>[OK] New node deleted correctly.")
+
 
 if __name__ == "__main__":
 
-    cluster_addr = "127.0.0.1:7000"
     addrs =["127.0.0.1:7000", "127.0.0.1:7001", "127.0.0.1:7002", "127.0.0.1:7003", "127.0.0.1:7004", "127.0.0.1:7005"]
 
     # Create
     control = RedisControl()
-    control.create_cluster_cmd(addrs, 1)
+    control.create_cluster_cmd(addrs)
 
     # Check
+    control.check_cluster_cmd()
     control = RedisControl(addrs[0])
-    control.check_cluster_cmd(addrs, 1)
+    control.check_cluster_cmd()
     time.sleep(1)
 
     # load data
@@ -925,26 +889,23 @@ if __name__ == "__main__":
     import uuid
     startup_nodes = [{"host": "127.0.0.1", "port": "7000"}]
     rc = StrictRedisCluster(startup_nodes=startup_nodes, decode_responses=True)
-    for index in range(100000):
-        if index % 1000 == 0:
-            print("loading .. %d" % int(index / 1000))
+    num = 100
+    for index in range(100 * num):
+        if index % num == 0:
+            print("loading .. %d" % int(index / num))
         rc.set(uuid.uuid4(), index)
 
     # add master
-    control = RedisControl()
-    control.addnode_cluster_cmd("127.0.0.1:7006", cluster_addr)
+    control.addnode_cluster_cmd("127.0.0.1:7006")
 
     # add slave
     new = ClusterNode("127.0.0.1:7006")
     new.load_info()
-    time.sleep(1)
-    control = RedisControl()
-    control.addnode_cluster_cmd("127.0.0.1:7007", cluster_addr, slave=True, master_id=new.full_name())
+    control.addnode_cluster_cmd("127.0.0.1:7007", slave=True, master_id=new.full_name())
     time.sleep(10)
 
     # rebalance
-    control = RedisControl()
-    control.rebalance_cluster_cmd(cluster_addr)
+    control.rebalance_cluster_cmd()
 
     # reshard
     new0 = ClusterNode("127.0.0.1:7000")
@@ -959,18 +920,11 @@ if __name__ == "__main__":
     new7.load_info()
 
 
-    control = RedisControl()
-    control.reshard_cluster_cmd(cluster_addr, new0.full_name(), [new6.full_name()], 1365)
+    #control = RedisControl(cluster_addr=addrs[0], fix=True)
+    control.reshard_cluster_cmd(new0.full_name(), [new6.full_name()], 1365)
+    control.reshard_cluster_cmd(new1.full_name(), [new6.full_name()], 1365)
+    control.reshard_cluster_cmd(new2.full_name(), [new6.full_name()], 1366)
 
-    control = RedisControl()
-    control.reshard_cluster_cmd(cluster_addr, new1.full_name(), [new6.full_name()], 1365)
-
-    control = RedisControl()
-    control.reshard_cluster_cmd(cluster_addr, new2.full_name(), [new6.full_name()], 1366)
-
-    control = RedisControl()
-    control.delnode_cluster_cmd(cluster_addr, new6.full_name())
-
-    control = RedisControl()
-    control.delnode_cluster_cmd(cluster_addr, new7.full_name())
+    control.delnode_cluster_cmd(new6.full_name())
+    control.delnode_cluster_cmd(new7.full_name())
     exit(0)

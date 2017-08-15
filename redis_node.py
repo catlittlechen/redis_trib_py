@@ -255,23 +255,35 @@ class ClusterNode():
                         slots.append(s[index])
                 if len(slots) > 0:
                     config.append(s[0] + ":" + ",".join(slots))
-        return "|".join(sorted(config))
+        data = "|".join(sorted(config))
+        print("%s sign %s" % (self, data))
+        return data
 
     def assert_empty(self):
         info = set(self.r.execute("cluster", "info").decode().split("\r\n"))
         db0 = str(self.r.execute("info")).find("db0:") != -1
         if "cluster_known_nodes:1" not in info:
             print("[ERR] Node %s is not empty. the node already knows other nodes (check with CLUSTER NODES)." % self)
+            exit(1)
         if db0:
             print("[ERR] Node %s is not empty. the node contains some key in database 0." % self)
             exit(1)
         return
 
 
+def createRedisNode(node_addr, new=False):
+    node = ClusterNode(node_addr)
+    node.connect()
+    node.assert_cluster()
+    if new:
+        node.assert_empty()
+    node.load_info()
+    return node
+
 if __name__ == "__main__":
     r = ClusterNode("127.0.0.1:7007")
     r.connect()
     r.assert_cluster()
     r.assert_empty()
-    #r.load_info()
-    #print(r.get_config_signature())
+    r.load_info()
+    r.get_config_signature()
