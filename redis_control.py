@@ -48,9 +48,11 @@ class RedisControl():
         return
 
     def reload_info(self):
+        self.wait_cluster_join()
         self.reset_nodes()
         self.load_cluster_info_from_node(self.cluster_addr)
         self.check_cluster()
+        time.sleep(1)
 
     def cluster_error(self, msg):
         self.errors.append(msg)
@@ -131,7 +133,7 @@ class RedisControl():
                 self.cluster_error("[WARNING] Node %s has slots in importing state (%s)."% (n, ",".join("%s" % k for k in keys)))
                 open_slots = open_slots.union(set(keys))
         if len(open_slots) > 0:
-            print("[WARNING] The following slots are open: %s" % ",".join(list(open_slots)))
+            print("[WARNING] The following slots are open: %s" % ",".join("%s" % n for n in open_slots))
         if self.fix:
             for s in open_slots:
                 self.fix_open_slot(s)
@@ -160,7 +162,7 @@ class RedisControl():
         for slot in not_covered:
             nodes = self.nodes_with_keys_in_slot(slot)
             slots[slot] = nodes
-            print("Slot %s has keys in %d nodes: %s" % (slot, len(nodes), ",".join(nodes)))
+            print("Slot %s has keys in %d nodes: %s" % (slot, len(nodes), ",".join("%s" % n for n in nodes)))
 
         none = {}
         single = {}
@@ -261,8 +263,8 @@ class RedisControl():
                 print("*** Found keys about slot %s in node %s!"% (slot, n))
                 importing.add(n)
 
-        print("Set as migrating in: %s" % ",".join(list(migrating)))
-        print("Set as importing in: %s" % ",".join(list(importing)))
+        print("Set as migrating in: %s" % ",".join("%s" % n for n in migrating))
+        print("Set as importing in: %s" % ",".join("%s" % n for n in importing))
 
         # If there is no slot owner, set as owner the slot with the biggest
         # number of keys, among the set of migrating / importing nodes.
@@ -332,7 +334,7 @@ class RedisControl():
         elif len(importing) == 0 and len(migrating) == 1 and len(migrating[0].r.execute("cluster", "getkeysinslot", slot, 1)) == 0:
             migrating[0].r.execute("cluster", "setslot", slot, "stable")
         else:
-            print("[ERR] Sorry, can't fix this slot yet (work in progress). Slot is set as migrating in %s, as importing in %s, owner is %s" % (",".join(migrating), ",".join(importing), owner))
+            print("[ERR] Sorry, can't fix this slot yet (work in progress). Slot is set as migrating in %s, as importing in %s, owner is %s" % (",".join("%s" % n for n in migrating), ",".join("%s" % n for n in importing), owner))
 
     # Check if all the nodes agree about the cluster configuration
     def check_config_consistency(self):
@@ -869,6 +871,57 @@ class RedisControl():
         self.reload_info()
         print(">>>[OK] New node deleted correctly.")
 
+    def auto_delnode_cluster_cmd(self, node_name, o={}):
+        print(">>> Auto removing node %s from cluster " % node_name)
+        opt = {
+            "pipeline" : MigrateDefaultPipeline,
+            "timeout": self.timeout
+        }
+        opt.update(o)
+
+        # Check if the node exists and is not empty
+        node = self.get_node_by_name(node_name)
+        if not node:
+            print("[ERR] No such node ID %s" % node_name)
+            exit(1)
+
+        # remove slots
+        if node.has_flag("master"):
+            slots = node.get_slots()
+            slots_length = len(slots)
+            if slots_length != 0:
+                # some other master
+                left_master = []
+                for n in self.nodes:
+                    if n.has_flag("master"):
+                        if n == node:
+                            continue
+                        left_master.append(n)
+                for n in left_master:
+                    n.info["balance"] = int(slots_length / len(left_master))
+                n.info["balance"] += slots_length - n.info["balance"] * len(left_master)
+                slots = sorted(list(slots))
+                for n in left_master:
+                    print("Resharding plan for %s:" % n)
+                    for index in range(n.info["balance"]):
+                        self.move_slot(node, n, slots[index], {"pipeline":opt['pipeline']})
+                    slots = slots[n.info["balance"]:]
+
+        # Send CLUSTER FORGET to all the nodes but the node to remove
+        print(">>> Sending CLUSTER FORGET messages to the cluster...")
+        for n in self.nodes:
+            if n == node:
+                continue
+            if n.info["replicate"] and n.info["replicate"] == node_name:
+                # Reconfigure the slave to replicate with some other node
+                master = self.get_master_with_least_replicas(node)
+                print(">>> %s as replica of %s" % (n, master))
+                n.r.execute("cluster", "replicate", master.full_name())
+            n.r.execute("cluster", "forget", node_name)
+
+        self.reload_info()
+        print(">>>[OK] New node deleted correctly.")
+
 
 if __name__ == "__main__":
 
@@ -908,23 +961,12 @@ if __name__ == "__main__":
     control.rebalance_cluster_cmd()
 
     # reshard
-    new0 = ClusterNode("127.0.0.1:7000")
-    new0.load_info()
-    new1 = ClusterNode("127.0.0.1:7001")
-    new1.load_info()
-    new2 = ClusterNode("127.0.0.1:7002")
-    new2.load_info()
     new6 = ClusterNode("127.0.0.1:7006")
     new6.load_info()
     new7 = ClusterNode("127.0.0.1:7007")
     new7.load_info()
 
 
-    #control = RedisControl(cluster_addr=addrs[0], fix=True)
-    control.reshard_cluster_cmd(new0.full_name(), [new6.full_name()], 1365)
-    control.reshard_cluster_cmd(new1.full_name(), [new6.full_name()], 1365)
-    control.reshard_cluster_cmd(new2.full_name(), [new6.full_name()], 1366)
-
-    control.delnode_cluster_cmd(new6.full_name())
     control.delnode_cluster_cmd(new7.full_name())
+    control.auto_delnode_cluster_cmd(new6.full_name())
     exit(0)
